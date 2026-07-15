@@ -387,7 +387,7 @@ func changeRoot(rootfsDir string, pivot bool) error {
 
 // getMonitorDevices returns the devices which are needed for the execution of
 // the monitor process
-func getMonitorDevices(needsKVM bool, needsTAP bool) ([]specs.LinuxDevice, error) {
+func getMonitorDevices(needsKVM bool) ([]specs.LinuxDevice, error) {
 	nullDev, err := deviceFromHost("/dev/null")
 	if err != nil {
 		return nil, fmt.Errorf("could not get host device /dev/null: %w", err)
@@ -396,15 +396,16 @@ func getMonitorDevices(needsKVM bool, needsTAP bool) ([]specs.LinuxDevice, error
 	if err != nil {
 		return nil, fmt.Errorf("could not get host device /dev/urandom: %w", err)
 	}
-	devices := []specs.LinuxDevice{nullDev, randomDev}
-
-	if needsTAP {
-		tunDev, err := deviceFromHost("/dev/net/tun")
-		if err != nil {
-			return nil, fmt.Errorf("could not get host device /dev/net/tun: %w", err)
-		}
-		devices = append(devices, tunDev)
+	// The tun device is always included because in urunc create we can not know
+	// if there will be a virtual ethernet device or not, since the CNI hooks
+	// have not executed yet. Therefore, the decision about whether it is actually
+	// created in the monitor rootfs is decided in Exec, which checks the
+	// network configuration.
+	tunDev, err := deviceFromHost("/dev/net/tun")
+	if err != nil {
+		return nil, fmt.Errorf("could not get host device /dev/net/tun: %w", err)
 	}
+	devices := []specs.LinuxDevice{nullDev, randomDev, tunDev}
 
 	if needsKVM {
 		kvmDev, err := deviceFromHost("/dev/kvm")

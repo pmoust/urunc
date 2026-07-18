@@ -302,9 +302,7 @@ func createReexecCmd(initSock *os.File, logPipe *os.File) *exec.Cmd {
 	reexecCommand.Env = append(reexecCommand.Env, "_LIBCONTAINER_INITPIPE=3")
 	reexecCommand.Env = append(reexecCommand.Env, "_LIBCONTAINER_LOGPIPE=4")
 	logLevel := strconv.Itoa(int(logrus.GetLevel()))
-	if logLevel != "" {
-		reexecCommand.Env = append(reexecCommand.Env, "_LIBCONTAINER_LOGLEVEL="+logLevel)
-	}
+	reexecCommand.Env = append(reexecCommand.Env, "_LIBCONTAINER_LOGLEVEL="+logLevel)
 
 	return reexecCommand
 }

@@ -18,9 +18,9 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
 	"runtime"
 
+	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v3"
 )
@@ -62,8 +62,11 @@ status of "ubuntu01" as "stopped" the following will delete resources held for
 					return ErrEmptyContainerID
 				}
 				rootDir := cmd.String("root")
-				containerDir := filepath.Join(rootDir, containerID)
-				e := os.RemoveAll(containerDir)
+				containerDir, e := securejoin.SecureJoin(rootDir, containerID)
+				if e != nil {
+					return e
+				}
+				e = os.RemoveAll(containerDir)
 				if e != nil {
 					logrus.Errorf("remove %s: %v", containerDir, e)
 				}

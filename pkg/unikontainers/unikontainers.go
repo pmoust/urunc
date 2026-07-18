@@ -351,7 +351,7 @@ func ChooseRootfs(bundle, specRoot string, annot map[string]string, cfg *UruncCo
 }
 
 // nolint:gocyclo
-func (u *Unikontainer) Exec(metrics m.Writer) error {
+func (u *Unikontainer) Exec(metrics m.Writer) (retErr error) {
 	metrics.Capture(m.TS15)
 
 	// container Paths
@@ -449,21 +449,6 @@ func (u *Unikontainer) Exec(metrics m.Writer) error {
 		unikernelParams.CmdLine = strings.Fields(u.State.Annotations[annotCmdLine])
 	}
 
-	// handle network
-	netArgs, err := u.SetupNet()
-	if err != nil {
-		uniklog.Errorf("failed to setup network: %v", err)
-		return err
-	}
-	metrics.Capture(m.TS16)
-	withTUNTAP := netArgs.IP != ""
-
-	// UnikernelParams
-	unikernelParams.Net = netArgs
-
-	// ExecArgs
-	vmmArgs.Net = netArgs
-
 	// virtiofsd config
 	virtiofsdConfig := u.UruncCfg.ExtraBins["virtiofsd"]
 
@@ -544,24 +529,77 @@ func (u *Unikontainer) Exec(metrics m.Writer) error {
 		}
 	}
 
-	if err = os.MkdirAll(rootfsParams.MonRootfs, 0o755); err != nil {
-		return fmt.Errorf("failed to create monitor rootfs directory %s: %w", rootfsParams.MonRootfs, err)
-	}
+	// Resource-acquiring setup. Each step registers a teardown so that a
+	// failure in this or any later stage -- before we pivot into the new
+	// rootfs -- unwinds the partial setup in reverse order, preventing leaks
+	// of TAP devices or mounts.
+	var netArgs types.NetDevParams
+	var withTUNTAP bool
+	setupCleanup, err := runSetupSteps([]setupStep{
+		{
+			name: "network",
+			run: func() error {
+				var nerr error
+				netArgs, nerr = u.SetupNet()
+				if nerr != nil {
+					uniklog.Errorf("failed to setup network: %v", nerr)
+					return nerr
+				}
+				metrics.Capture(m.TS16)
+				withTUNTAP = netArgs.IP != ""
+				return nil
+			},
+			// Remove any TAP device left in the sandbox's network namespace.
+			teardown: func() error {
+				if netArgs.TapDev == "" {
+					return nil
+				}
+				return network.CleanupAllUruncTaps()
+			},
+		},
+		{
+			name: "monitor-rootfs",
+			run: func() error {
+				if err := os.MkdirAll(rootfsParams.MonRootfs, 0o755); err != nil {
+					return fmt.Errorf("failed to create monitor rootfs directory %s: %w", rootfsParams.MonRootfs, err)
+				}
 
-	// Prepare Monitor rootfs
-	// Make sure that rootfs is mounted with the correct propagation
-	// flags so we can later pivot if needed.
-	err = prepareRoot(rootfsParams.MonRootfs, u.Spec.Linux.RootfsPropagation)
+				// Prepare Monitor rootfs
+				// Make sure that rootfs is mounted with the correct propagation
+				// flags so we can later pivot if needed.
+				if err := prepareRoot(rootfsParams.MonRootfs, u.Spec.Linux.RootfsPropagation); err != nil {
+					return err
+				}
+
+				// Setup the rootfs for the monitor execution, creating necessary
+				// devices and the monitor's binary.
+				return prepareMonRootfs(rootfsParams.MonRootfs, vmm.Path(), u.UruncCfg.Monitors[vmmType].DataPath, vmm.UsesKVM(), withTUNTAP)
+			},
+			// Unmount everything that was mounted under the monitor rootfs.
+			teardown: func() error {
+				return cleanupMonRootfs(rootfsParams.MonRootfs)
+			},
+		},
+	})
 	if err != nil {
+		// runSetupSteps has already unwound the partial setup.
 		return err
 	}
 
-	// Setup the rootfs for the monitor execution, creating necessary
-	// devices and the monitor's binary.
-	err = prepareMonRootfs(rootfsParams.MonRootfs, vmm.Path(), u.UruncCfg.Monitors[vmmType].DataPath, vmm.UsesKVM(), withTUNTAP)
-	if err != nil {
-		return err
-	}
+	// Undo the resource-acquiring steps above if any later stage fails before
+	// we commit to the new rootfs via changeRoot.
+	committed := false
+	defer func() {
+		if retErr != nil && !committed {
+			if cerr := setupCleanup.unwind(); cerr != nil {
+				uniklog.WithError(cerr).Error("failed to fully clean up after Exec error")
+			}
+		}
+	}()
+
+	// UnikernelParams / ExecArgs network
+	unikernelParams.Net = netArgs
+	vmmArgs.Net = netArgs
 
 	err = rfsBuilder.postSetup()
 	if err != nil {
@@ -647,6 +685,10 @@ func (u *Unikontainer) Exec(metrics m.Writer) error {
 	if err != nil {
 		return err
 	}
+	// From here on we have pivoted/chrooted into the new rootfs. The mount
+	// paths registered for cleanup are no longer reachable from the new root,
+	// so stop unwinding them on error.
+	committed = true
 
 	// uid/gid
 	// Setup uid, gid and additional groups for the monitor process
